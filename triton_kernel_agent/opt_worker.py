@@ -270,6 +270,8 @@ class OptimizationWorker:
             workdir=self.workdir,
             high_reasoning_effort=self.high_reasoning_effort,
             target_platform=self.target_platform,
+            warmup=self.benchmark_warmup,
+            repeat=self.benchmark_repeat,
         )
         for k, v in resolved.items():
             if k not in self._platform:
