@@ -243,8 +243,16 @@ class OptimizationWorker:
             return
         from triton_kernel_agent.platform.registry import registry
 
+        # verification_worker needs worker-level context (workdir/provider)
+        # that the shared kwargs bag doesn't fully supply and that isn't a
+        # registered factory; it's built manually in _init_components.
+        # Exclude it from the registry pass to avoid KeyError on an
+        # unregistered component.
+        registry_config = {
+            k: v for k, v in self._platform_config.items() if k != "verification_worker"
+        }
         resolved = registry.create_from_config(
-            self._platform_config,
+            registry_config,
             logger=self.logger,
             log_dir=self.log_dir,
             artifacts_dir=self.artifact_dir,
@@ -254,6 +262,14 @@ class OptimizationWorker:
             gpu_name=self.gpu_name,
             roofline_config=self.roofline_config,
             num_bottlenecks=self.num_bottlenecks_to_request,
+            # Worker-level context needed to construct the worker-level
+            # components (e.g. benchmarker/profiler=remote). Harmless to
+            # other factories: _filter_kwargs drops keys their __init__
+            # doesn't accept.
+            worker_id=self.worker_id,
+            workdir=self.workdir,
+            high_reasoning_effort=self.high_reasoning_effort,
+            target_platform=self.target_platform,
         )
         for k, v in resolved.items():
             if k not in self._platform:
@@ -273,18 +289,21 @@ class OptimizationWorker:
         )
 
         # Benchmarking
-        from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
-            Benchmark,
-        )
+        if "benchmarker" in self._platform:
+            self.benchmarker = self._platform["benchmarker"]
+        else:
+            from triton_kernel_agent.opt_worker_component.benchmarking.benchmark import (
+                Benchmark,
+            )
 
-        self.benchmarker = Benchmark(
-            logger=self.logger,
-            artifacts_dir=self.artifact_dir,
-            benchmark_lock=self.benchmark_lock,
-            worker_id=self.worker_id,
-            warmup=self.benchmark_warmup,
-            repeat=self.benchmark_repeat,
-        )
+            self.benchmarker = Benchmark(
+                logger=self.logger,
+                artifacts_dir=self.artifact_dir,
+                benchmark_lock=self.benchmark_lock,
+                worker_id=self.worker_id,
+                warmup=self.benchmark_warmup,
+                repeat=self.benchmark_repeat,
+            )
 
         # Profiler
         if "profiler" in self._platform:
@@ -320,16 +339,35 @@ class OptimizationWorker:
             )
 
         # Verification worker (for correctness checks)
-        from triton_kernel_agent.worker import VerificationWorker
+        vw_spec = self._platform_config.get("verification_worker") if self._platform_config else None
+        if vw_spec and isinstance(vw_spec, dict) and vw_spec.get("impl") == "remote":
+            # Remote verification: run tests on the daemon, keep the
+            # refine loop + LLM calls local. Built manually (not via the
+            # registry) because it needs the worker's own context.
+            from triton_kernel_agent.platform.remote import RemoteVerificationWorker
 
-        self.verification_worker = VerificationWorker(
-            worker_id=self.worker_id,
-            workdir=self.workdir,
-            log_dir=self.log_dir,
-            openai_model=self.openai_model,
-            high_reasoning_effort=self.high_reasoning_effort,
-            target_platform=self.target_platform,
-        )
+            self.verification_worker = RemoteVerificationWorker(
+                url=vw_spec["url"],
+                token=vw_spec.get("token"),
+                timeout=vw_spec.get("timeout", 600.0),
+                worker_id=self.worker_id,
+                workdir=self.workdir,
+                log_dir=self.log_dir,
+                openai_model=self.openai_model,
+                high_reasoning_effort=self.high_reasoning_effort,
+                target_platform=self.target_platform,
+            )
+        else:
+            from triton_kernel_agent.worker import VerificationWorker
+
+            self.verification_worker = VerificationWorker(
+                worker_id=self.worker_id,
+                workdir=self.workdir,
+                log_dir=self.log_dir,
+                openai_model=self.openai_model,
+                high_reasoning_effort=self.high_reasoning_effort,
+                target_platform=self.target_platform,
+            )
 
         # Roofline analyzer
         if "roofline_analyzer" in self._platform:

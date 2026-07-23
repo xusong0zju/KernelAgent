@@ -133,10 +133,23 @@ class PlatformRegistry:
 
     def create_from_config(
         self,
-        config: dict[str, str],
+        config: dict[str, Any],
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Create multiple components from a ``{component: name}`` dict.
+        """Create multiple components from a ``{component: spec}`` dict.
+
+        Each *spec* may be either:
+
+        - a **plain string** — the implementation name (e.g. ``"nvidia"``);
+          the factory receives only the shared ``**kwargs`` bag. This is
+          the original form and stays fully backward-compatible.
+        - a **dict** — ``{"impl": name, ...extra_params}``; the factory
+          receives the shared ``**kwargs`` *plus* the per-component
+          ``extra_params`` (per-component params override shared kwargs on
+          key collision). This lets a single config carry connection info
+          for ``remote`` components, e.g.
+          ``{"profiler": {"impl": "remote", "url": "...", "token": "..."}}``
+          without polluting other components or env-globals.
 
         Every component listed in *config* is instantiated via
         :meth:`create`, sharing the same *kwargs* bag (each factory
@@ -145,10 +158,23 @@ class PlatformRegistry:
         Returns:
             ``{component_key: instance}`` for every entry in *config*.
         """
-        return {
-            component: self.create(component, name, **kwargs)
-            for component, name in config.items()
-        }
+        instances: dict[str, Any] = {}
+        for component, spec in config.items():
+            if isinstance(spec, dict):
+                spec = dict(spec)  # shallow copy; we pop from it
+                name = spec.pop("impl", None)
+                if name is None:
+                    raise ValueError(
+                        f"platform config for {component!r} is a dict but "
+                        f"has no 'impl' key: {spec!r}"
+                    )
+                merged = {**kwargs, **spec}
+            else:
+                name = spec
+                merged = kwargs
+            instances[component] = self.create(component, name, **merged)
+        return instances
+
 
 
 # ------------------------------------------------------------------
@@ -250,6 +276,26 @@ def _register_builtins() -> None:
     }
     for component, factory in _noop.items():
         registry.register(component, "noop", factory)
+
+    from triton_kernel_agent.platform.remote import (
+        RemoteBenchmarker,
+        RemoteKernelProfiler,
+        RemoteVerifier,
+    )
+
+    # Remote (HTTP daemon) implementations. Only the GPU-touching
+    # interfaces are remote; specs/roofline/bottleneck/rag stay local on
+    # the agent brain, so they deliberately have no "remote" entry. A
+    # config using ``platform: remote`` is therefore normally a *mixed*
+    # dict (e.g. verifier/benchmarker/profiler=remote + the rest=nvidia/
+    # noop) rather than the bare shorthand — see the plan's config section.
+    _remote = {
+        "verifier": RemoteVerifier,
+        "benchmarker": RemoteBenchmarker,
+        "profiler": RemoteKernelProfiler,
+    }
+    for component, factory in _remote.items():
+        registry.register(component, "remote", factory)
 
 
 _register_builtins()

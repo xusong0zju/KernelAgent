@@ -41,6 +41,10 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov",
 ]
+remote = [
+    "fastapi",
+    "uvicorn",
+]
 
 [project.scripts]
 fuser-ui = "scripts.fuser_ui:main"
