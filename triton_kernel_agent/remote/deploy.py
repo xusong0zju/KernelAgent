@@ -333,6 +333,19 @@ def deploy(
     daemon_port = daemon_port or _DEFAULT_PORT
     local_port = local_port or daemon_port
 
+    # Kill any prior daemon on that port so a fresh deploy binds cleanly
+    # (otherwise the new process dies on "address already in use" and the
+    # tunnel reaches the STALE daemon — token mismatch → 401).
+    try:
+        _run_remote(
+            ssh_host, ssh_port, ssh_user, ssh_pass,
+            f"pkill -f 'remote_daemon.py --port {daemon_port}' || true; "
+            f"sleep 1",
+            timeout=30,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("pre-deploy pkill failed (continuing): %s", e)
+
     # 1. sync code
     _sync_repo_tar(ssh_host, ssh_port, ssh_user, ssh_pass, repo, remote_dir)
     # 2. ensure deps
