@@ -197,13 +197,28 @@ echo "PYBIN=$PYBIN"
 """
 
 
-def _ensure_env_and_deps(host, port, user, password, remote_dir: str) -> str:
-    """Ensure remote repo installed editable; return the remote python bin path."""
-    code, out = _run_remote(
-        host, port, user, password,
-        _SETUP_SCRIPT.format(remote_dir=shlex.quote(remote_dir)),
-        timeout=900,
-    )
+def _ensure_env_and_deps(host, port, user, password, remote_dir: str, python_bin: str | None = None) -> str:
+    """Ensure remote repo installed editable; return the remote python bin path.
+
+    If ``python_bin`` is given (an absolute remote path), use it directly
+    instead of probing — useful when the auto-detected env has a known
+    incompatibility (e.g. triton 3.3 on py3.12 hits ``PY_SSIZE_T_CLEAN``).
+    """
+    if python_bin:
+        # Use the given python directly; just ensure pip + install the package.
+        script = (
+            f"set -e\ncd {shlex.quote(remote_dir)}\n"
+            f'PYBIN={shlex.quote(python_bin)}\n'
+            f'"$PYBIN" -m pip --version >/dev/null 2>&1 || "$PYBIN" -m ensurepip --upgrade\n'
+            f'"$PYBIN" -m pip install -e ".[remote]" || "$PYBIN" -m pip install -e . --no-deps\n'
+            f'"$PYBIN" -c "import torch, triton, fastapi, uvicorn; '
+            f'print(\'torch\', torch.__version__, \'cuda\', torch.cuda.is_available(), '
+            f"'| triton', triton.__version__, '| fastapi', fastapi.__version__)\"\n"
+            f'echo "PYBIN=$PYBIN"\n'
+        )
+    else:
+        script = _SETUP_SCRIPT.format(remote_dir=shlex.quote(remote_dir))
+    code, out = _run_remote(host, port, user, password, script, timeout=900)
     if code != 0:
         raise RuntimeError(f"remote setup failed (exit {code}):\n{out}")
     logger.info("remote env ready:\n%s", out.strip())
@@ -306,8 +321,14 @@ def deploy(
     remote_dir: str = _DEFAULT_REMOTE_DIR,
     daemon_port: int | None = None,
     local_port: int | None = None,
+    python_bin: str | None = None,
 ) -> RemoteHandle:
-    """Deploy + launch daemon + open tunnel. Returns a RemoteHandle."""
+    """Deploy + launch daemon + open tunnel. Returns a RemoteHandle.
+
+    ``python_bin`` (absolute remote path) overrides the auto-detected
+    python; use it when the default env is incompatible (e.g. triton on
+    py3.12).
+    """
     token = secrets.token_urlsafe(24)
     daemon_port = daemon_port or _DEFAULT_PORT
     local_port = local_port or daemon_port
@@ -315,7 +336,7 @@ def deploy(
     # 1. sync code
     _sync_repo_tar(ssh_host, ssh_port, ssh_user, ssh_pass, repo, remote_dir)
     # 2. ensure deps
-    pybin = _ensure_env_and_deps(ssh_host, ssh_port, ssh_user, ssh_pass, remote_dir)
+    pybin = _ensure_env_and_deps(ssh_host, ssh_port, ssh_user, ssh_pass, remote_dir, python_bin)
     # 3+4. launch daemon
     _launch_daemon(ssh_host, ssh_port, ssh_user, ssh_pass, remote_dir, pybin,
                    daemon_port, token)
@@ -375,6 +396,9 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=_DEFAULT_PORT, help="daemon (and default local) port")
     ap.add_argument("--local-port", type=int, default=None)
     ap.add_argument("--teardown", action="store_true", help="kill an existing daemon + tunnel")
+    ap.add_argument("--python-bin", default=None,
+                    help="absolute remote python path (e.g. ~/miniconda3/envs/ka_gpu/bin/python); "
+                         "overrides auto-detect — use when default env is incompatible")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -396,7 +420,7 @@ def main() -> None:
 
     handle = deploy(host, port, user, pwd, Path(args.repo),
                     remote_dir=args.remote_dir, daemon_port=args.port,
-                    local_port=args.local_port)
+                    local_port=args.local_port, python_bin=args.python_bin)
     print("\n========================================")
     print("Remote GPU daemon is UP. Paste this into your config:")
     print("========================================")
