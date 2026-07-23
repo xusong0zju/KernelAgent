@@ -22,6 +22,16 @@ from utils.providers.relay_provider import RelayProvider
 
 # Registry of all available models (external/OSS version)
 AVAILABLE_MODELS = [
+    # DeepSeek-V4-Pro via an Anthropic-compatible gateway (e.g. KingCloud kspmas).
+    # Authenticated with ANTHROPIC_AUTH_TOKEN + ANTHROPIC_BASE_URL read by the SDK.
+    # NOTE: do not append a "[1m]"-style suffix to the name — the gateway rejects
+    # unknown model strings with HTTP 403 ("model not activated"). Use the bare
+    # model id; long context is handled by the gateway, not the model name.
+    ModelConfig(
+        name="deepseek-v4-pro",
+        provider_classes=[AnthropicProvider],
+        description="DeepSeek-V4-Pro via Anthropic-compatible gateway (kspmas)",
+    ),
     ModelConfig(
         name="o4-mini",
         provider_classes=[OpenAIProvider],

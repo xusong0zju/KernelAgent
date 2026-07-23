@@ -89,6 +89,20 @@ LLM_RELAY_URL=http://127.0.0.1:11434
 LLM_RELAY_TIMEOUT_S=120
 ```
 
+#### Anthropic-compatible gateways (e.g. DeepSeek-V4-Pro via KingCloud kspmas)
+You can point the Anthropic provider at a third-party Anthropic-compatible
+gateway by setting `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` instead of
+`ANTHROPIC_API_KEY`. The `anthropic` SDK reads these env vars itself, so no
+code change is needed — just register the model name in
+`utils/providers/available_models.py` and select it with `OPENAI_MODEL`.
+```bash
+ANTHROPIC_AUTH_TOKEN=<token>
+ANTHROPIC_BASE_URL=https://kspmas.ksyun.com   # gateway ROOT; the SDK appends /v1/messages
+OPENAI_MODEL=deepseek-v4-pro                   # registered name; do NOT add a "[1m]" suffix
+```
+Reasoning models that prepend a `thinking` block (e.g. DeepSeek-V4-Pro) are
+handled — the provider returns the first `text` block.
+
 More knobs live in `triton_kernel_agent/agent.py` and `Fuser/config.py`.
 
 ## End-to-End Kernel Generation Workflows
