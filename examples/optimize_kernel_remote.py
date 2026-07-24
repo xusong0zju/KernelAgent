@@ -175,7 +175,27 @@ def main():
     print(f"[baseline] initial kernel = {cur_ms:.3f} ms  (eager {eager_ms:.3f}, kernel {cur_ms/eager_ms*100:.0f}% of eager)")
 
     best_kernel, best_ms = initial, cur_ms
-    print(f"[goal] beat {best_ms:.3f} ms\n")
+    best_src = "triton-initial"
+
+    # Optional CUDA candidate: a hand-written kernel_cuda.py in the dir is
+    # treated as a baseline candidate alongside the Triton ones. The daemon
+    # runs it via the same run_test/benchmark path (kernel_cuda uses
+    # torch.utils.cpp_extension; the compiled .so is cached on the box).
+    cuda_file = kd / "kernel_cuda.py"
+    cuda_code = cuda_file.read_text() if cuda_file.exists() else None
+    if cuda_code:
+        print("[cuda] verifying hand-written CUDA candidate ...", flush=True)
+        ok, _, cerr = verify(args.url, args.token, cuda_code, problem_code, test_code)
+        if ok:
+            cuda_ms = benchmark(args.url, args.token, cuda_code, problem_code, args.warmup, args.repeat)
+            print(f"[cuda] CUDA candidate = {cuda_ms:.3f} ms  (vs triton-initial {cur_ms:.3f})")
+            if cuda_ms < best_ms:
+                best_ms, best_kernel, best_src = cuda_ms, cuda_code, "cuda"
+                print(f"[cuda] → CUDA is now best ({cuda_ms:.3f} ms)")
+        else:
+            print(f"[cuda] CUDA candidate FAILED verify: {cerr[-160:]}")
+
+    print(f"[goal] beat {best_ms:.3f} ms (current best: {best_src})\n")
 
     for r in range(1, args.rounds + 1):
         print(f"--- round {r}/{args.rounds} ---")
@@ -198,13 +218,13 @@ def main():
         sp = (best_ms - cand_ms) / best_ms * 100
         print(f"  [bench] {cand_ms:.3f} ms vs best {best_ms:.3f} ms ({sp:+.1f}%)  {'✅ FASTER' if cand_ms < best_ms else '⏸ not faster'}")
         if cand_ms < best_ms:
-            best_ms, best_kernel = cand_ms, cand
+            best_ms, best_kernel, best_src = cand_ms, cand, f"triton-round{r}"
             (kd / f"best_round{r}.py").write_text(best_kernel)
             print(f"  → saved best_round{r}.py")
 
     print("\n" + "=" * 72 + "\nRESULT")
     print(f"  initial : {cur_ms:.3f} ms")
-    print(f"  best    : {best_ms:.3f} ms   ({(1-best_ms/cur_ms)*100:+.1f}% vs initial)")
+    print(f"  best    : {best_ms:.3f} ms   ({(1-best_ms/cur_ms)*100:+.1f}% vs initial)  [{best_src}]")
     print(f"  eager   : {eager_ms:.3f} ms   (best is {best_ms/eager_ms*100:.0f}% of eager)")
     (kd / "best.py").write_text(best_kernel)
     print(f"  saved   : {kd/'best.py'}")

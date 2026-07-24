@@ -336,15 +336,28 @@ def deploy(
     # Kill any prior daemon on that port so a fresh deploy binds cleanly
     # (otherwise the new process dies on "address already in use" and the
     # tunnel reaches the STALE daemon — token mismatch → 401).
-    try:
-        _run_remote(
+    # Use -9 and a broad pattern; -f substring match should hit the process,
+    # but we retry + verify it's gone, because some shells' pkill via ssh
+    # is flaky.
+    for _ in range(3):
+        try:
+            _run_remote(
+                ssh_host, ssh_port, ssh_user, ssh_pass,
+                f"pkill -9 -f remote_daemon || true; sleep 2; "
+                f"pgrep -f remote_daemon >/dev/null && echo STILL_RUNNING || echo CLEAN",
+                timeout=30,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("pre-deploy pkill failed (continuing): %s", e)
+        # check the echoed status
+        code, out = _run_remote(
             ssh_host, ssh_port, ssh_user, ssh_pass,
-            f"pkill -f 'remote_daemon.py --port {daemon_port}' || true; "
-            f"sleep 1",
-            timeout=30,
+            "pgrep -f remote_daemon >/dev/null && echo STILL || echo CLEAN",
+            timeout=20,
         )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("pre-deploy pkill failed (continuing): %s", e)
+        if "CLEAN" in out:
+            break
+        logger.warning("daemon still running after pkill, retrying")
 
     # 1. sync code
     _sync_repo_tar(ssh_host, ssh_port, ssh_user, ssh_pass, repo, remote_dir)
