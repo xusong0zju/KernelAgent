@@ -64,14 +64,29 @@ class AnthropicProvider(BaseProvider):
             raise RuntimeError("Anthropic client not available")
 
         user_content = messages[-1]["content"] if messages else ""
-        response = self.client.messages.create(
-            model=model_name,
-            max_tokens=min(
-                kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
-            ),
-            temperature=kwargs.get("temperature", 0.7),
-            messages=[{"role": "user", "content": user_content}],
+        max_tokens = min(
+            kwargs.get("max_tokens", 8192), self.get_max_tokens_limit(model_name)
         )
+        create_kwargs: dict = {
+            "model": model_name,
+            "max_tokens": max_tokens,
+            "temperature": kwargs.get("temperature", 0.7),
+            "messages": [{"role": "user", "content": user_content}],
+        }
+        # Optional thinking budget for reasoning models (e.g. DeepSeek-V4-Pro
+        # via the KingCloud gateway). Without a budget, reasoning models can
+        # spend the entire max_tokens on the thinking block and never emit a
+        # final answer. Set ANTHROPIC_THINKING_BUDGET (int tokens) to cap the
+        # chain-of-thought so the answer has room. max_tokens must exceed the
+        # budget; we enforce that here.
+        budget = os.getenv("ANTHROPIC_THINKING_BUDGET")
+        if budget:
+            b = int(budget)
+            if max_tokens <= b:
+                max_tokens = b + max(4096, b)
+                create_kwargs["max_tokens"] = max_tokens
+            create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": b}
+        response = self.client.messages.create(**create_kwargs)
 
         return LLMResponse(
             content=self._extract_text(response), model=model_name, provider=self.name
@@ -84,13 +99,17 @@ class AnthropicProvider(BaseProvider):
         Reasoning models (e.g. DeepSeek-V4-Pro) prepend a ``thinking`` block;
         ``response.content[0]`` is then a ``ThinkingBlock`` without a ``.text``
         attribute. Skip non-text blocks and take the first ``TextBlock``.
+
+        If there is NO text block (the model only produced thinking and ran out
+        of tokens before a final answer), return an empty string — NOT a
+        stringified ThinkingBlock. Reasoning models' thinking drafts can
+        contain half-written code that callers would mistake for the answer;
+        returning "" lets callers retry cleanly.
         """
         for block in response.content:
             if getattr(block, "type", None) == "text":
                 return block.text
-        # No text block at all — fall back to a stringified response so the
-        # caller still gets something meaningful rather than an IndexError.
-        return str(response.content)
+        return ""
 
     def get_multiple_responses(
         self, model_name: str, messages: list[dict[str, str]], n: int = 1, **kwargs

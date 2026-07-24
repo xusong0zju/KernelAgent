@@ -1,0 +1,9 @@
+# BEV Lift-Splat（LSS/BEVFusion 风格，简化版）
+name: BEV Lift-Splat
+gpu: NVIDIA RTX 2080 Ti (Turing SM7.5, 68 SMs, 616 GB/s, 11 GB)
+problem_short: "feat[2,32,24,48] x depth_weight[2,24,48,16] -> lift (outer) -> scatter-add to BEV[48,48,32]. Already fused (no materialized outer product)."
+directions: |
+  - block-local reduce same BEV cell before atomic
+  - one program per (b,h) handling all w,d for higher compute density
+  - vectorized atomic_add over C (one call for all C elements)
+  - precompute linear index lookup

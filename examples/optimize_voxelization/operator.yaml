@@ -1,0 +1,8 @@
+# 点云 Voxelization（PointPillars/VoxelNet 风格）
+name: Voxelization
+gpu: NVIDIA RTX 2080 Ti (Turing SM7.5, 68 SMs, 616 GB/s, 11 GB)
+problem_short: "N=200K 3D points (x,y,z,feat) -> mean-pool into [256,256,8] voxel grid -> out [256,256,8,4]"
+directions: |
+  - block-local reduce before atomic add (fewer atomic ops)
+  - larger BLOCK (1024) for better occupancy
+  - avoid per-point scalar Python work
