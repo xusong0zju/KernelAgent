@@ -12,6 +12,7 @@
 | [triton-py312-pyssize-clean-crash](triton-py312-pyssize-clean-crash.md) | Triton kernel 编译报 `PY_SSIZE_T_CLEAN macro must be defined` | triton 3.3 的 C 扩展与 py3.12 不兼容，建 py3.11 环境（ka_gpu）即可 |
 | [reasoning-model-thinking-budget](reasoning-model-thinking-budget.md) | 推理模型（deepseek-v4-pro 等）复杂 prompt 返回空（`len=0`，纯 thinking） | 限制 `thinking.budget_tokens`（设 `ANTHROPIC_THINKING_BUDGET`），让思考收敛、给答案留空间——与"effort 调 max"相反 |
 | [atomic-scatter-triton-vs-cuda-attribution](atomic-scatter-triton-vs-cuda-attribution.md) | 看到"CUDA 比 Triton 快"想归因"Triton 表达力" | 先做 naive 同结构 A/B（隔离编译器）、random vs sorted（隔离局部性/归约）。真因常是编译器在随机高冲突 atomic 下的优势，不是表达力；输入有序时 Triton 向量化能逼近 CUDA |
+| [cross-language-probe-paradigm-escape](cross-language-probe-paradigm-escape.md) | 单一框架优化到顶、说不清慢在哪 | 用第二语言（常 CUDA/C）当性能探针 + 范式转换器，拆变量、再翻译回原框架。纯待在 A 范式里想不到用 A 本就支持但文档不强调的特性 |
 
 ## 与项目各文档的关系
 
@@ -19,6 +20,7 @@
 - **远程环境**：`triton-py312-pyssize-clean-crash` ← `docs/远程GPU部署.md` 坑1（ka_gpu 来源）
 - **LLM 优化闭环**：`reasoning-model-thinking-budget` ← `docs/具身3D算子优化实录.md` 发现1（voxelization 优化靠它）
 - **CUDA vs Triton 归因**：`atomic-scatter-triton-vs-cuda-attribution` ← `docs/具身3D算子优化实录.md` 深度对照
+- **跨语言探针方法论**：`cross-language-probe-paradigm-escape` ← `docs/用CUDA当探针优化Triton.md`
 
 ## 为什么双份（工程内 + 工程外）
 
