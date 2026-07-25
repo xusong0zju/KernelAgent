@@ -17,91 +17,58 @@ version: 1.0.0
 date: 2026-07-25
 ---
 
-# Atomic-scatter: Triton vs CUDA attribution
+# Atomic scatter：Triton vs CUDA 的正确归因
 
-## Problem
+## 问题
 
-You hand-wrote a CUDA kernel (via torch cpp_extension) for an
-atomic-bound scatter kernel — e.g. voxelization (point → atomic-add into
-voxel grid), BEV lift-splat, point-cloud hashing. It runs 2-3x faster
-than the Triton version. You (or your agent) are tempted to conclude
-"Triton lacks the expressivity for block-level reduction / shared memory,
-that's why it's slow." **This attribution is usually wrong.**
+你为 atomic-bound 的 scatter kernel（voxelization 点→voxel 原子累加、BEV lift-splat、点云 hash）手写了 CUDA kernel（经 torch cpp_extension），它比 Triton 版快 2-3x。你（或你的 agent）可能得出结论："Triton 缺 shared-memory / block-reduce 表达力，所以慢"。**这个归因通常是错的。**
 
-## Context / Trigger Conditions
+## 触发条件
 
-- A scatter-add kernel where each thread does N atomicAdd into a shared
-  buffer keyed by a computed index (voxel id, BEV cell).
-- CUDA version uses `float4` loads + `atomicAdd`; Triton uses `tl.load` +
-  `tl.atomic_add` with mask.
-- CUDA measured 2-2.5x faster on random/unsorted input.
-- Someone claims "Triton can't do block reduction because
-  `tl.static_shared`/`tl.shared` don't exist" → WRONG leap.
+- scatter-add kernel：每个 thread 对一个共享 buffer 按"计算出的索引"（voxel id / BEV cell）做 N 次 atomicAdd。
+- CUDA 版用 `float4` load + `atomicAdd`；Triton 版用 `tl.load` + 带 mask 的 `tl.atomic_add`。
+- 随机/无序输入下 CUDA 快 2-2.5x。
+- 有人声称"Triton 做不了 block 归约，因 `tl.static_shared`/`tl.shared` 不存在" → 错误跳跃。
 
-## Root Cause (the right attribution)
+## 根因（正确归因）
 
-For atomic-bound scatter on **high-contention (random)** input, the
-CUDA-vs-Triton gap is dominated by **compiler quality**, not algorithm or
-expressivity:
+对**高冲突（随机）**输入的 atomic-bound scatter，CUDA-vs-Triton 差距主要来自**编译器质量**，不是算法或表达力：
 
-- **nvcc** lowers `atomicAdd` to optimal `red.global` paths and coalesces
-  multiple `atomicAdd` to the same cache line; `float4` load = one 16B
-  transaction.
-- **Triton's LLVM backend** emits less optimal atomic lowering and does
-  NOT coalesce same-line atomics from masked `tl.atomic_add`; vectorized
-  loads require the 2D-block-pointer form (extra index arithmetic).
-- Block-level reduction (shared-mem segment merge) contributes only ~10%
-  on **point-sparse** shapes (avg <1 point/voxel) — too few same-voxel
-  neighbors to merge. So "writing reduction in CUDA" is NOT the main win.
+- **nvcc** 把 `atomicAdd` lowering 到最优 `red.global` 路径，合并同 cache line 的多个 atomicAdd；`float4` load = 一次 16B 事务。
+- **Triton 的 LLVM 后端** 生成的 atomic lowering 次优，且不从带 mask 的 `tl.atomic_add` 合并同 line 原子；向量化 load 要 2D block ptr 形式（多余索引运算）。
+- block 级归约（shared mem 段合并）在**点稀疏** shape（平均 <1 点/voxel）只贡献 ~10%——同 voxel 邻居太少没得合并。所以"CUDA 写归约"不是主要收益。
 
-The classic WRONG attribution: "CUDA fast because block reduction cuts
-atomic count from N to unique-voxels/block." On sparse input there are
-almost no runs of same-voxel neighbors, so reduction barely fires.
+经典错误归因："CUDA 快是因为 block 归约把原子数从 N 降到 unique-voxels/block"。稀疏输入下几乎没有同 voxel 连续段，归约几乎不触发。
 
-## Solution / Diagnostic procedure
+## 诊断流程
 
-Before claiming "Triton expressivity limits", run these three tests. They
-take one afternoon and prevent the wrong conclusion.
+在断言"Triton 表达力限制"前，跑这三个测试。一个下午，避免错误结论。
 
-### Test 1: Does the reduction even fire? (random vs sorted input)
+### 测试 1：归约到底有没有生效？（random vs sorted 输入）
 
-Same kernel, two inputs: random points vs points **pre-sorted by voxel
-index** (voxelization is permutation-invariant, so sorting is a legal
-transform). Measure both.
+同一 kernel，两种输入：随机点 vs **按 voxel 索引预排序的点**（voxelization 对点序不敏感，排序是合法变换）。都测时间。
 
-- If sorted ≪ random → reduction/locality fires when neighbors are
-  adjacent. The random-time gap is partly "no locality", not "no
-  reduction".
-- If sorted ≈ random → reduction never fired anyway (sparse), so
-  crediting reduction for CUDA's speed is wrong.
+- 若 sorted ≪ random → 归约/局部性在邻居相邻时触发。random 的慢部分是"无局部性"，不是"无归约"。
+- 若 sorted ≈ random → 归约本就没生效（稀疏），那把 CUDA 的快归功于归约就是错的。
 
-### Test 2 (decisive): naive same-structure A/B (isolate compiler)
+### 测试 2（决定性）：naive 同结构 A/B（隔离编译器）
 
-Write a **CUDA naive** = the CUDA kernel with the block-reduction and
-shared-mem REMOVED — pure per-point 5 atomicAdd, structurally identical
-to the Triton naive. Now compare three on random & sorted:
+写 **CUDA naive** = 去掉 block 归约和 shared mem 的 CUDA kernel，纯每点 5 atomicAdd，结构上和 Triton naive 完全相同。然后三者在 random/sorted 下对比：
 
 ```
                 random   sorted
-triton_naive    0.557    0.264   # Triton, no reduction
-cuda_naive      0.274    0.104   # CUDA,  no reduction, SAME structure
-cuda_v1(reduce) 0.246    0.100   # CUDA,  with block reduction
+triton_naive    0.557    0.264   # Triton，无归约
+cuda_naive      0.274    0.104   # CUDA， 无归约，同结构
+cuda_v1(归约)   0.246    0.100   # CUDA， 有 block 归约
 ```
 
-Read it as:
-- `cuda_naive` vs `cuda_v1`: reduction's contribution = ~10% (random),
-  ~0% (sorted). Reduction is NOT the main win.
-- `triton_naive` vs `cuda_naive` (SAME algorithm, different compiler):
-  CUDA 2.0-2.5x faster → **the gap is compiler quality**, not
-  expressivity/reduction.
+读法：
+- `cuda_naive` vs `cuda_v1`：归约贡献 = random ~10%、sorted ~0%。**归约不是主要收益**。
+- `triton_naive` vs `cuda_naive`（**同算法、不同编译器**）：CUDA 快 2.0-2.5x → **差距是编译器质量**，不是表达力/归约。
 
-### Test 3: Can Triton close the gap by vectorizing? (port the win back)
+### 测试 3：Triton 向量化能否追平？（把优势移植回 Triton）
 
-Implement the Triton kernel with **2D block-pointer load + 2D
-`tl.atomic_add`** (one [BLOCK,4] load + one [BLOCK,4] atomic instead of
-4 scalar each) — porting CUDA's `float4`+coalesced-atomic advantage back
-into Triton. Column extraction needs `tl.where(d==k, pts, 0).sum(axis=1)`
-since Triton forbids `pts[:,i]`.
+Triton kernel 用 **2D block ptr load + 2D `tl.atomic_add`**（一次 [BLOCK,4] load + 一次 [BLOCK,4] atomic 替代 4 次标量）——把 CUDA 的 `float4`+合并原子优势移植回 Triton。取列要用 `tl.where(d==k, pts, 0).sum(axis=1)`（Triton 禁止 `pts[:,i]`）。
 
 ```
                 random   sorted
@@ -110,63 +77,30 @@ triton_vec      0.370    0.118   # 2D load+atomic
 cuda_naive      0.274    0.104
 ```
 
-- On **sorted** input: triton_vec 0.118 ≈ cuda_naive 0.104 → vectorizing
-  **closes the gap** (compiler difference nearly vanishes when atomics
-  have locality).
-- On **random** input: triton_vec 0.370 still > cuda_naive 0.274 → the
-  residual 1.35x is nvcc's cache-line atomic coalescing on high
-  contention, which Triton's backend can't replicate.
+- **sorted** 输入：triton_vec 0.118 ≈ cuda_naive 0.104 → 向量化**追平**（原子有局部性时编译器差距几乎消失）。
+- **random** 输入：triton_vec 0.370 仍 > cuda_naive 0.274 → 残余 1.35x 是 nvcc 在高冲突下的 cache-line 原子合并，Triton 后端做不到。
 
-## Decision rule
+## 决策规则
 
-After the three tests:
+三个测试后：
 
-1. **Input naturally ordered** (LiDAR scan lines, sorted batches)? →
-   Triton vectorized ≈ CUDA. **No need for CUDA.** Triton is enough.
-2. **Input random, high atomic contention** → CUDA ~1.35-2.5x faster,
-   gap is compiler (atomic lowering + cache-line coalescing), NOT
-   expressivity. Use CUDA if the 1.5x matters; don't blame Triton
-   "expressivity".
-3. **Point-sparse shape** (avg <1 point/bin) → block reduction gives
-   only ~10%. Don't over-engineer reduction; vectorize first (cheap 1.5x).
-4. Never conclude "Triton expressivity limit" without the Test-2
-   same-structure A/B. The `tl.static_shared`/`tl.shared` absence is a
-   red herring — Triton has `tl.sort`/`tl.reduce`/`tl.sum(axis=)` that
-   implement block reduction internally.
+1. **输入天然有序**（LiDAR 扫描线、预排序 batch）？→ Triton 向量化 ≈ CUDA。**不必上 CUDA**，Triton 够。
+2. **输入随机、高原子冲突** → CUDA 快 1.35-2.5x，差距是编译器（atomic lowering + cache-line 合并），**不是表达力**。若 1.5x 重要就用 CUDA；别怪"Triton 表达力"。
+3. **点稀疏 shape**（平均 <1 点/bin）→ block 归约只值 ~10%。别为追归约强上复杂结构，先向量化（便宜 1.5x）。
+4. **没做测试 2 同结构 A/B，别下"Triton 表达力限制"结论**。`tl.static_shared`/`tl.shared` 缺失是红鲱鱼——Triton 有 `tl.sort`/`tl.reduce`/`tl.sum(axis=)` 内部就实现了 block 归约。
 
-## Verification
+## 验证
 
-The three numeric tables above are the verification. Reproduce on a
-single GPU (RTX 2080 Ti, Triton 3.7, CUDA 13) by running the kernels in
-`examples/optimize_voxelization/`:
-`triton_naive.py`, `triton_vec.py`, `kernel_cuda_naive.py`,
-`kernel_cuda.py` (+ sorted-input variant by argsort in problem.py).
+上面三张数字表就是验证。在单卡 GPU（RTX 2080 Ti、Triton 3.7、CUDA 13）跑 `examples/optimize_voxelization/` 的 `triton_naive.py` / `triton_vec.py` / `kernel_cuda_naive.py` / `kernel_cuda.py`（+ problem.py 里 argsort 的 sorted 变体）即可复现。
 
-## Notes
+## 注意
 
-- A subtle confound: CUDA's `float4` load vs Triton's 4×`tl.load`. Test 2
-  uses `float4` in cuda_naive (so it's not a pure compiler-only
-  comparison — load vectorization is mixed in). To fully isolate, write
-  cuda_naive with 4×scalar `__ldg` loads; the gap to float4-version
-  isolates load cost from atomic-lowering cost. (In practice the combined
-  "compiler+vectorization" attribution is what matters for the decision.)
-- `tl.sort` returns a single sorted tensor (no permutation in 3.7); to
-  sort multiple arrays by one key you need the `tl.join`/broadcast trick
-  or sort-then-recompute — which is why multi-column block reduction is
-  awkward (not impossible) in Triton. But Test 2 shows reduction isn't
-  the bottleneck anyway on sparse input.
-- The 0.022ms bandwidth floor (13.7MB @ 616GB/s) is NOT achievable for
-  atomic-bound scatter — atomics serialize. Real floor ≈ atomic
-  throughput × N, far above bandwidth floor. Don't chase the bandwidth
-  number on scatter kernels.
+- 混淆点：cuda_naive 用了 `float4` load（不是纯编译器对照，load 向量化混进来了）。要完全隔离，写用 4×标量 `__ldg` 的 cuda_naive，和 float4 版比，隔离 load 成本 vs atomic-lowering 成本。（实践中"编译器+向量化"混合归因才是决策要的。）
+- `tl.sort`（3.7）返回单值排序 tensor（无 perm）；按一个 key 排序多数组要 `tl.join`/broadcast 技巧或 sort-then-recompute——所以多列 block 归约在 Triton 里别扭（不是不可能）。但测试 2 表明稀疏输入下归约本不是瓶颈。
+- 0.022ms 带宽下限（13.7MB @ 616GB/s）对 atomic-bound scatter **不可达**——原子会序列化。真实下限 ≈ atomic 吞吐 × N，远高于带宽下限。别在 scatter kernel 上追带宽数。
 
-## References
+## 参考
 
-- Empirically established on RTX 2080 Ti (SM7.5) + Triton 3.7.1 + CUDA
-  13.0, 2026-07-25. Numbers: triton_naive 0.557/0.264, cuda_naive
-  0.274/0.104, triton_vec 0.370/0.118 (random/sorted).
-- KernelAgent `docs/具身3D算子优化实录.md` "Voxelization 的 CUDA vs Triton
-  深度对照" — full tables and the wrong→right attribution correction.
-- Related: the `reasoning-model-thinking-budget` skill (different domain,
-  same lesson: don't accept the first plausible attribution — run the
-  isolating experiment).
+- 实测于 RTX 2080 Ti（SM7.5）+ Triton 3.7.1 + CUDA 13.0，2026-07-25。数字：triton_naive 0.557/0.264，cuda_naive 0.274/0.104，triton_vec 0.370/0.118（random/sorted）。
+- KernelAgent `docs/具身3D算子优化实录.md` "Voxelization 的 CUDA vs Triton 深度对照"——完整表格 + 错→对归因修正。
+- 关联：`reasoning-model-thinking-budget` skill（不同领域，同样教训：别接受第一个看似合理的归因——跑隔离实验）。

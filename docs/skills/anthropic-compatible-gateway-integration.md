@@ -17,43 +17,33 @@ version: 1.0.0
 date: 2026-07-23
 ---
 
-# Anthropic-Compatible Gateway Integration
+# 接 Anthropic 兼容网关
 
-## Problem
+## 问题
 
-You want to point the `anthropic` Python SDK at a third-party gateway
-(e.g. a cloud proxy such as KingCloud `kspmas.ksyun.com` fronting
-DeepSeek-V4-Pro, or DeepSeek's own `https://api.deepseek.com/anthropic`)
-instead of `api.anthropic.com`. The gateway authenticates with a bearer
-token and exposes a base URL that may look like an OpenAI path. Naive
-wiring fails in four non-obvious ways, each with a misleading symptom.
+你想把 `anthropic` Python SDK 指向第三方网关（如代理 DeepSeek-V4-Pro 的金山云 `kspmas.ksyun.com`，或 DeepSeek 自家的 `https://api.deepseek.com/anthropic`），而非 `api.anthropic.com`。网关用 bearer token 鉴权，base URL 可能长得像 OpenAI 路径。朴素接线会在 4 个非显而易见处失败，每个症状都误导人。
 
-## Context / Trigger Conditions
+## 触发条件
 
-Reach for this skill when you see any of:
+看到以下任一就用本 skill：
 
-- `AttributeError: 'ThinkingBlock' object has no attribute 'text'` (often
-  surfaced through pydantic's `__getattr__`) right after a successful
-  `messages.create` call.
-- HTTP `403 Forbidden` with body like
-  `{"error":{"message":"Your account ... has not activated the model deepseek-v4-pro[1m]. Please activate the model ..."}}`.
-- A working Claude Code config uses `ANTHROPIC_BASE_URL=https://host/v1/chat/completions`, but your own anthropic-SDK code 404s or routes oddly.
-- You have `ANTHROPIC_AUTH_TOKEN` set but the provider's `is_available()` returns False because it only reads `ANTHROPIC_API_KEY`.
-- httpx logs show a doubled path: `POST https://host/v1/chat/completions/v1/messages`.
+- `AttributeError: 'ThinkingBlock' object has no attribute 'text'`（常经 pydantic `__getattr__` 浮出），紧接一次成功的 `messages.create` 之后。
+- HTTP `403 Forbidden`，body 形如 `{"error":{"message":"Your account ... has not activated the model deepseek-v4-pro[1m]. Please activate the model ..."}}`。
+- 可用的 Claude Code 配置用 `ANTHROPIC_BASE_URL=https://host/v1/chat/completions`，但你自己写的 anthropic-SDK 代码 404 或路由怪。
+- 设了 `ANTHROPIC_AUTH_TOKEN` 但 provider 的 `is_available()` 返回 False，因为它只读 `ANTHROPIC_API_KEY`。
+- httpx 日志显示双路径：`POST https://host/v1/chat/completions/v1/messages`。
 
-## Solution
+## 解决
 
-### 0. Probe the protocol BEFORE wiring code (don't assume)
+### 0. 接线代码前先探测协议（别假设）
 
-A gateway named with `ANTHROPIC_*` env vars is not guaranteed to speak
-Anthropic Messages. Probe with a raw POST (no SDK) using a no-proxy opener,
-trying both protocols and a couple of base_url truncations:
+用 `ANTHROPIC_*` env 命名的网关不一定说 Anthropic Messages 协议。用裸 POST（不经 SDK）+ no-proxy opener 探测，两种协议 + 几种 base_url 截断都试：
 
 ```python
 import os, json, urllib.request
 TOKEN = os.environ["ANTHROPIC_AUTH_TOKEN"]
 HOST = "https://kspmas.ksyun.com"
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # avoid socks/ALL_PROXY
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # 避 socks/ALL_PROXY
 def probe(url, proto, model):
     body = {"model": model, "max_tokens": 8192,
             "messages": [{"role":"user","content":"Reply with exactly: PONG"}]}
@@ -62,96 +52,65 @@ def probe(url, proto, model):
                   else {"Authorization":f"Bearer {TOKEN}"})}
     req = urllib.request.Request(url, json.dumps(body).encode(), headers, method="POST")
     with opener.open(req, timeout=40) as r: print(r.status, r.read().decode()[:300])
-# anthropic endpoint
+# anthropic 端点
 probe(f"{HOST}/v1/messages", "anthropic", "deepseek-v4-pro")
-# openai endpoint
+# openai 端点
 probe(f"{HOST}/v1/chat/completions", "openai", "deepseek-v4-pro")
 ```
 
-A **403 "model not activated"** means the endpoint exists and authed
-(routed fine) — it's a model-name problem (see #3), not a routing 404.
-A **200** tells you the working protocol + response shape. Anthropic
-responses look like `{"content":[{"type":"text","text":"PONG"}], "usage":{...}}`;
-OpenAI like `{"choices":[{"message":{"content":"PONG"}}]}`.
+**403 "model not activated"** = 端点存在且鉴权通过（路由 OK），是模型名问题（见 #3），不是路由 404。
+**200** = 拿到可用协议 + 响应形态。Anthropic 响应形如 `{"content":[{"type":"text","text":"PONG"}], "usage":{...}}`；OpenAI 形如 `{"choices":[{"message":{"content":"PONG"}}]}`。
 
-### 1. Let the SDK self-read env (don't pass base_url yourself)
+### 1. 让 SDK 自读 env（别自己传 base_url）
 
-The `anthropic` SDK (verified on 0.117.1) reads these env vars itself when
-no constructor args are given:
+`anthropic` SDK（0.117.1 验证）在不传构造参数时自己读这些 env：
 
-- `ANTHROPIC_AUTH_TOKEN` → sent as `Authorization: Bearer <token>` (this is
-  what bearer-token gateways expect; `ANTHROPIC_API_KEY` instead sends
-  `x-api-key`).
-- `ANTHROPIC_BASE_URL` → the client base URL. Importantly, **even when you
-  pass `api_key=` explicitly, `base_url` is still read from env.** So the
-  minimal change is: if `ANTHROPIC_API_KEY` is unset but
-  `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` are, construct `Anthropic()`
-  with NO args and let the SDK resolve both from env.
+- `ANTHROPIC_AUTH_TOKEN` → 作 `Authorization: Bearer <token>` 发（bearer-token 网关要的就是这个；`ANTHROPIC_API_KEY` 则发 `x-api-key`）。
+- `ANTHROPIC_BASE_URL` → client base URL。关键是：**即使你显式传 `api_key=`，`base_url` 仍从 env 读**。所以最小改动：若 `ANTHROPIC_API_KEY` 没设但 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 有，就 `Anthropic()` 不传参，让 SDK 从 env 解析两者。
 
 ```python
 api_key = self._get_api_key("ANTHROPIC_API_KEY")
 if api_key:
-    self.client = Anthropic(api_key=api_key)            # standard path unchanged
+    self.client = Anthropic(api_key=api_key)            # 标准路径不变
 elif os.getenv("ANTHROPIC_AUTH_TOKEN") or os.getenv("ANTHROPIC_BASE_URL"):
-    self.client = Anthropic()                            # SDK self-reads env
+    self.client = Anthropic()                            # SDK 自读 env
 ```
 
-Confirm: `client.auth_headers == {'Authorization': 'Bearer <token>'}` and
-`client.base_url` is your gateway. No code change to base_url passing
-needed.
+确认：`client.auth_headers == {'Authorization': 'Bearer <token>'}`，`client.base_url` 是你的网关。不必改 base_url 传参代码。
 
-### 2. base_url = gateway ROOT, not the full chat path
+### 2. base_url 用网关根，不要带完整 chat 路径
 
-Pass `ANTHROPIC_BASE_URL` as the host root (e.g. `https://kspmas.ksyun.com`),
-**not** `https://host/v1/chat/completions`. The SDK appends `/v1/messages`
-itself. A trailing `/v1/chat/completions` concatenates into
-`/v1/chat/completions/v1/messages` — a doubled path. Some gateways happen
-to tolerate it (return 200 anyway), but it's fragile; prefer the clean root.
+`ANTHROPIC_BASE_URL` 设主机根（如 `https://kspmas.ksyun.com`），**不要** `https://host/v1/chat/completions`。SDK 自己拼 `/v1/messages`。带 `/v1/chat/completions` 尾巴会拼成 `/v1/chat/completions/v1/messages`——双路径。有些网关恰好容忍（仍返回 200），但脆弱，用干净根。
 
-Note: a Claude Code config may use the full `/v1/chat/completions` base_url
-because the Claude Code client normalizes it internally. That does NOT mean
-the raw `anthropic` SDK wants the same string.
+注意：Claude Code 配置可能用带 `/v1/chat/completions` 的 base_url，因 Claude Code 客户端内部规整。这不代表裸 `anthropic` SDK 要同样字符串。
 
-### 3. Strip model-name suffixes like `[1m]`
+### 3. 剥掉模型名后缀如 `[1m]`
 
-Some clients (Claude Code) append context-window markers such as
-`deepseek-v4-pro[1m]` and strip them before sending. Third-party gateways
-generally do NOT recognize these suffixes and return
-`403 ... has not activated the model deepseek-v4-pro[1m]`. Register and call
-with the **bare model id** (`deepseek-v4-pro`); long-context is handled by
-the gateway, not encoded in the name. If your provider layer passes the
-model name through verbatim (most do), do the stripping at registration time.
+有些客户端（Claude Code）加上下文窗口标记如 `deepseek-v4-pro[1m]`，发请求前剥掉。第三方网关一般不认这些后缀，返回 `403 ... has not activated the model deepseek-v4-pro[1m]`。注册和调用都用**裸 model id**（`deepseek-v4-pro`）；长上下文由网关处理，不编码进名。若你的 provider 层原样透传 model 名（多数如此），在注册时剥。
 
-### 4. Handle ThinkingBlock from reasoning models
+### 4. 处理推理模型的 ThinkingBlock
 
-Reasoning models (e.g. DeepSeek-V4-Pro, DeepSeek-R1) return
-`response.content = [ThinkingBlock, TextBlock]` — the thinking block comes
-FIRST and has NO `.text` attribute. The common pattern
-`response.content[0].text` raises
-`AttributeError: 'ThinkingBlock' object has no attribute 'text'`. Iterate
-and take the first `text` block:
+推理模型（如 DeepSeek-V4-Pro、DeepSeek-R1）返回 `response.content = [ThinkingBlock, TextBlock]`——thinking 块在前，且**没有 `.text` 属性**。常见写法 `response.content[0].text` 抛 `AttributeError: 'ThinkingBlock' object has no attribute 'text'`。遍历取首个 `text` 块：
 
 ```python
 @staticmethod
 def _extract_text(response) -> str:
     for block in response.content:
-        if getattr(block, "type", None) == "text":   # skip ThinkingBlock
+        if getattr(block, "type", None) == "text":   # 跳过 ThinkingBlock
             return block.text
-    return str(response.content)  # fallback; avoid IndexError
+    return ""   # 无 text block（纯 thinking）→ 返回空，让调用方干净重试，
+                # 别返回 str(response.content)——会把思考草稿当答案
 ```
 
-Use `block.type == "text"` rather than importing `TextBlock`/`ThinkingBlock`
-classes — string comparison is robust to SDK internal class renames.
+用 `block.type == "text"` 而非 import `TextBlock`/`ThinkingBlock` 类——字符串比较不受 SDK 内部类改名影响。
 
-Caveat: with a too-small `max_tokens` (e.g. 16) the model may not finish
-thinking, so `content` is ALL thinking blocks and no text block. Use a
-realistic `max_tokens` (e.g. 8192) and check `stop_reason == "end_turn"`.
+注意：`max_tokens` 太小（如 16）时模型可能没思考完，`content` 全是 thinking 块无 text。用合理 `max_tokens`（如 8192）+ 查 `stop_reason == "end_turn"`。若模型常因思考吃光预算不答，见 `reasoning-model-thinking-budget` skill。
 
-## Verification
+## 验证
 
 ```python
 import os
-os.environ.pop("ANTHROPIC_API_KEY", None)   # force token path
+os.environ.pop("ANTHROPIC_API_KEY", None)   # 强制走 token 路径
 import anthropic
 c = anthropic.Anthropic()
 assert c.base_url == os.environ["ANTHROPIC_BASE_URL"].rstrip("/")
@@ -162,43 +121,28 @@ text = next(b.text for b in r.content if b.type == "text")
 assert text.strip() == "PONG"
 ```
 
-## Example
+## 例子
 
-Integrating a `BaseProvider` subclass that already calls
-`Anthropic(api_key=...)`. Two edits make it gateway-ready:
+把一个已调 `Anthropic(api_key=...)` 的 `BaseProvider` 子类改成支持网关，两处编辑：
 
-1. In client init, add the env-self-read fallback (Solution #1).
-2. In response parsing, replace `response.content[0].text` with the
-   `_extract_text` helper (Solution #4).
-3. Register the bare model id (`deepseek-v4-pro`, no `[1m]`) in the model
-   registry; point users at `.env`:
+1. client init 加 env 自读 fallback（解决 #1）。
+2. 响应解析把 `response.content[0].text` 换成 `_extract_text` helper（解决 #4）。
+3. 模型注册表注册裸 model id（`deepseek-v4-pro`，无 `[1m]`）；`.env` 指引：
    ```
    ANTHROPIC_AUTH_TOKEN=<token>
    ANTHROPIC_BASE_URL=https://kspmas.ksyun.com
    OPENAI_MODEL=deepseek-v4-pro
    ```
 
-## Notes
+## 注意
 
-- `ANTHROPIC_API_KEY` takes precedence if set — it sends `x-api-key` and
-  targets `api.anthropic.com` by default. To use a gateway, ensure
-  `ANTHROPIC_API_KEY` is UNSET and only `ANTHROPIC_AUTH_TOKEN` +
-  `ANTHROPIC_BASE_URL` are set (or the SDK still reads `ANTHROPIC_BASE_URL`
-  even with `ANTHROPIC_API_KEY`, but auth header differs — probe to be sure).
-- Avoid the `ALL_PROXY=socks://...` trap (httpx rejects socks scheme);
-  probe/wraps should use a no-proxy opener or `unset ALL_PROXY all_proxy`.
-- `temperature` is honored by most gateways for non-reasoning models; some
-  reasoning models pin their own sampling and ignore it — harmless.
-- This is about gateway plumbing, not model quality. Kernel/search scaffolds
-  around the LLM still determine the ceiling.
+- `ANTHROPIC_API_KEY` 设了优先——它发 `x-api-key`、默认指向 `api.anthropic.com`。要用网关，确保 `ANTHROPIC_API_KEY` 未设、只设 `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL`（或 SDK 即使设了 `ANTHROPIC_API_KEY` 也读 `ANTHROPIC_BASE_URL`，但 auth header 不同——探测确认）。
+- 避 `ALL_PROXY=socks://...` 坑（httpx 拒 socks scheme）；探测/包装用 no-proxy opener 或 `unset ALL_PROXY all_proxy`。
+- `temperature` 多数网关对非推理模型生效；部分推理模型自定采样忽略它——无害。
+- 这是网关管道，不是模型质量。LLM 周边的 kernel/搜索脚手架仍决定上限。
 
-## References
+## 参考
 
-- anthropic Python SDK: `Anthropic.__init__` accepts `api_key` and
-  `auth_token` (both keyword-only); env resolution for `ANTHROPIC_AUTH_TOKEN`
-  and `ANTHROPIC_BASE_URL` confirmed empirically on SDK 0.117.1 — verify
-  against your installed version's source (`inspect.getsource`).
-- DeepSeek Anthropic-compatible endpoint: `https://api.deepseek.com/anthropic`.
-- Reasoning/thinking blocks: Anthropic Messages API `thinking` extended-
-  thinking blocks; third-party reasoning models mirror the `content[].type`
-  shape.
+- anthropic Python SDK：`Anthropic.__init__` 接 `api_key` 和 `auth_token`（均 keyword-only）；`ANTHROPIC_AUTH_TOKEN` 和 `ANTHROPIC_BASE_URL` 的 env 解析在 SDK 0.117.1 实测确认——以你装版本源码为准（`inspect.getsource`）。
+- DeepSeek Anthropic 兼容端点：`https://api.deepseek.com/anthropic`。
+- reasoning/thinking 块：Anthropic Messages API `thinking` 扩展思考块；第三方推理模型镜像 `content[].type` 形态。
