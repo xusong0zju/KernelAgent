@@ -10,23 +10,35 @@
 
 KernelAgent 把"PyTorch 程序 → 优化 Triton kernel"拆成**两条独立流水线**，共用一套基础设施。
 
-```
-┌─────────────────────────────────────────────────────────┐
-│  入口: TritonKernelAgent (agent.py)                       │
-├──────────────────────┬──────────────────────────────────┤
-│ ① 生成流水线           │ ② 优化流水线                       │
-│ generate_kernel()     │ optimize (OptimizationManager)   │
-│ "从问题描述生成可用 kernel"│ "从初始 kernel 优化到更快"        │
-│ WorkerManager         │ OptimizationManager              │
-│  └ VerificationWorker │  └ OptimizationWorker           │
-│     (正确性精炼)        │      └ OptimizationOrchestrator │
-│ manager.py            │ opt_manager.py / opt_worker.py    │
-└──────────┬───────────┴──────────┬────────────────────────┘
-           │  共用基础设施（六子系统）  │
-  ┌──────────▼──────────────────────▼────────┐
-  │ LLM Provider │ 平台抽象 │ Benchmark │ Profiling │ 搜索/去重 │ Prompt │
-  │ utils/providers │ platform/ │ benchmarking/ │ profiling/ │ searching/ │ prompt_manager │
-  └─────────────────────────────────────────┘
+```mermaid
+graph TB
+    Entry["入口: TritonKernelAgent<br/>(agent.py)"]
+    subgraph Pipeline1["① 生成流水线 — 从问题描述生成可用 kernel"]
+        direction LR
+        WM["WorkerManager<br/>manager.py"]
+        VW["VerificationWorker<br/>(正确性精炼)"]
+        WM --> VW
+    end
+    subgraph Pipeline2["② 优化流水线 — 从初始 kernel 优化到更快"]
+        direction LR
+        OM["OptimizationManager<br/>opt_manager.py"]
+        OW["OptimizationWorker<br/>opt_worker.py"]
+        ORC["OptimizationOrchestrator<br/>(NCU+beam+reflexion)"]
+        OM --> OW --> ORC
+    end
+    Entry --> Pipeline1
+    Entry --> Pipeline2
+    subgraph Base["共用基础设施（六子系统）"]
+        direction LR
+        P1["LLM Provider<br/>utils/providers"]
+        P2["平台抽象<br/>platform/"]
+        P3["Benchmark<br/>benchmarking/"]
+        P4["Profiling<br/>profiling/"]
+        P5["搜索/去重<br/>searching/"]
+        P6["Prompt<br/>prompt_manager"]
+    end
+    Pipeline1 --> Base
+    Pipeline2 --> Base
 ```
 
 **两条流水线互不调用**：
@@ -81,19 +93,17 @@ scripts/remote_daemon.py      # 云端 FastAPI daemon
 
 入口 `TritonKernelAgent.generate_kernel`（`agent.py:462`）。目标：从问题描述生成一个**能通过测试**的 kernel。
 
-```
-generate_kernel(problem_description, test_code?)
-  │
-  ├─ _generate_test()            # agent.py:214  LLM 生成 test.py（可选）
-  ├─ 建 session_dir (.fuse/...)   # agent.py:512
-  ├─ _generate_kernel_seeds()     # agent.py:337  生成 num_workers 个种子
-  │     └─ provider.get_multiple_responses(n=num_workers, temp=0.8)  # 多样性
-  │        或 不支持多采样时多次单调用 (temp 0.8 + i*0.1)
-  ├─ manager.run_verification()   # manager.py:117  并行验证
-  │     └─ mp.Process × num_workers 起 VerificationWorker (manager.py:177)
-  │         每个 worker: 跑 test → 失败则 LLM refine → 再跑 (worker.py)
-  │         首个成功设 success_event，终止其他 worker (manager.py:189)
-  └─ 返回 {success, kernel_code, worker_id, rounds, session_dir}
+```mermaid
+flowchart TD
+    Start(["generate_kernel(problem_description, test_code?)"]) --> GenTest["_generate_test()<br/>agent.py:214 LLM 生成 test.py（可选）"]
+    GenTest --> Sess["建 session_dir (.fuse/...)<br/>agent.py:512"]
+    Sess --> Seeds["_generate_kernel_seeds()<br/>agent.py:337 生成 num_workers 个种子"]
+    Seeds --> Multi{{"provider.get_multiple_responses<br/>n=num_workers, temp=0.8 多样性<br/>或不支持多采样时多次单调用"}}
+    Multi --> Verify["manager.run_verification()<br/>manager.py:117 并行验证"]
+    Verify --> Workers["mp.Process × num_workers<br/>起 VerificationWorker<br/>manager.py:177"]
+    Workers --> Wloop["每个 worker: 跑 test → 失败则 LLM refine → 再跑<br/>(worker.py, max_rounds 轮)"]
+    Wloop --> First{{"首个成功设 success_event<br/>终止其他 worker<br/>manager.py:189"}}
+    First --> Ret(["返回 {success, kernel_code,<br/>worker_id, rounds, session_dir}"])
 ```
 
 关键点：
@@ -152,15 +162,52 @@ orchestrator **同时追踪两个 best**（`orchestrator.py:376-383`）：
 
 ### 4.4 beam search 怎么选候选 `beam_search.py:132`
 
+```mermaid
+flowchart LR
+    TK["top_kernels<br/>按 time_ms 升序"] --> TopK["top_kernels[:num_expanding_parents]"]
+    TopK --> Cart{{"笛卡尔积<br/>parent × bottleneck_id × model × sample_idx"}}
+    Par["parent<br/>(beam 父本)"] --> Cart
+    BN["bottleneck_id<br/>LLM 第 N 个瓶颈<br/>→ worker 攻不同瓶颈"] --> Cart
+    Mod["models<br/>多 LLM 扇出"] --> Cart
+    Smp["sample_idx<br/>samples_per_prompt"] --> Cart
+    Cart --> Num["num_workers_needed = P × M × K × C<br/>beam_search.py:103"]
 ```
-BeamSearchStrategy.select_candidates(round):
-  ├─ 取 top_kernels[:num_expanding_parents]        # beam_search.py:147  按 time_ms 升序截断
-  ├─ 对每个 (parent, bottleneck_id, model, sample_idx) 笛卡尔积   # :147-159
-  │     bottleneck_id: LLM 返回第 N 个瓶颈 → 不同 worker 攻不同瓶颈（多样性来源）
-  │     models: 多 LLM 扇出；sample_idx: samples_per_prompt
-  └─ num_workers_needed = P × M × K × C            # :103
-```
+
 **无温度/概率采样**——beam 成员按 `time_ms` 升序截断（`:220`），多样性来自"多瓶颈 × 多模型 × 多采样"的笛卡尔积，不是采样分布。
+
+### 4.5 优化流水线总览（双层循环）
+
+```mermaid
+flowchart TD
+    User(["用户: agent.optimize /<br/>OptimizationManager.run_optimization"]) --> Base["基线: verify初始 +<br/>benchmark(eager/compiled/初始kernel)"]
+    Base --> RoundLoop
+
+    subgraph RoundLoop["策略层循环  for round in max_rounds  [opt_manager.py]"]
+        direction TB
+        Sel["beam_search.select_candidates<br/>取 top_kernels 笛卡尔积"]
+        RunW["_run_workers<br/>mp.Process × N 并行 worker<br/>opt_manager.py:567"]
+        Upd["strategy.update_with_results<br/>PTX 去重 + 更新 top_kernels"]
+        Term{{"should_terminate<br/>roofline 到顶?"}}
+        Sel --> RunW --> Upd --> Term
+    end
+
+    RunW --> OrchLoop
+
+    subgraph OrchLoop["orchestrator 层循环  for r in max_opt_rounds(5)  [每个 worker 内]"]
+        direction TB
+        Prof["_profile_and_analyze<br/>NCU + roofline + LLM 瓶颈分析<br/>orchestrator.py:756"]
+        Pmpt["render prompt<br/>(瓶颈处方 + reflexion + history)"]
+        Gen["_generate_optimized_kernel<br/>LLM 生成 :903"]
+        VR["_verify_and_refine :935"]
+        Bench["benchmark(CUDA event) + SOL profile<br/>:518 :526"]
+        UB["_update_kernels<br/>双轨 best(runtime / sol) :1082<br/>发散超 50% 回退"]
+        Ref["_generate_reflexion → 下轮 :964"]
+        Prof --> Pmpt --> Gen --> VR --> Bench --> UB --> Ref --> Prof
+    end
+
+    Term -- 否 --> Sel
+    Term -- 是/轮数到 --> Best["get_best_program<br/>→ output/best_kernel.py"]
+```
 
 ---
 
@@ -346,31 +393,9 @@ platform:
 
 ## 十二、一图总览运行过程（优化流水线）
 
-```
-用户: agent.optimize / OptimizationManager.run_optimization
-  │
-  ├─ 基线: verify初始 + benchmark(eager/compiled/初始kernel)
-  │
-  ├─ for round in max_rounds:                     [策略层 opt_manager]
-  │    │
-  │    ├─ beam_search.select_candidates            取 top_kernels 笛卡尔积
-  │    │
-  │    ├─ _run_workers (mp.Process × N)            [并行 worker]
-  │    │    └─ OptimizationWorker.optimize_kernel
-  │    │       └─ OptimizationOrchestrator.optimize_kernel
-  │    │          for r in max_opt_rounds(5):      [orchestrator 层]
-  │    │            ├─ NCU profile + roofline + LLM 瓶颈分析
-  │    │            ├─ prompt(瓶颈处方 + reflexion + history)
-  │    │            ├─ LLM 生成 → verify_and_refine
-  │    │            ├─ benchmark(CUDA event) + SOL profile
-  │    │            ├─ 双轨更新 best(runtime / sol)
-  │    │            └─ 生成 reflexion → 下轮
-  │    │
-  │    ├─ strategy.update_with_results             PTX 去重 + 更新 top_kernels
-  │    └─ should_terminate                         roofline 到顶?
-  │
-  └─ get_best_program → output/best_kernel.py
-```
+优化流水线的完整运行过程见上面"4.5"的 mermaid 图：策略层 `run_optimization` 循环 + orchestrator 层 5 轮循环嵌套，基线测量 → beam 选候选 → 并行 worker → NCU+瓶颈+reflexion → 双轨 best → 早停。
+
+简化闭环（我们这次跑 voxelization/BEV 用的 `optimize_kernel_remote.py`）跳过了"策略层 + orchestrator 层 + NCU/beam/reflexion"，只保留"LLM 生成 → daemon verify → daemon benchmark → 比 best"最外圈，原因见第十节。
 
 ---
 
